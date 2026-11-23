@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -68,6 +70,8 @@ func (f *fakeMachine) Provision(req ProvisionRequest) (*Job, error) {
 }
 
 func (f *fakeMachine) BackendName() string { return f.backend }
+
+func (f *fakeMachine) Jobs() []JobView { return f.jobs.Views() }
 
 func newFakeMachine() *fakeMachine {
 	f := &fakeMachine{
@@ -175,14 +179,22 @@ func TestMachineHandlerAuthAndLoopback(t *testing.T) {
 	f := newFakeMachine()
 	h := machineHandler(passthrough(), f, machineTestToken)
 
+	// 成功分支会读 status，固定公网 IP 避免测试去外网探测。
+	setPublicIPOverride("203.0.113.10")
+	t.Cleanup(func() { setPublicIPOverride("") })
+
 	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", "", "", "")); w.Code != http.StatusUnauthorized {
 		t.Errorf("无 token 状态码 = %d，期望 401", w.Code)
 	}
 	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", "wrong-token", "", "")); w.Code != http.StatusUnauthorized {
 		t.Errorf("错误 token 状态码 = %d，期望 401", w.Code)
 	}
-	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "192.0.2.10:1234", "")); w.Code != http.StatusForbidden {
-		t.Errorf("非 loopback 状态码 = %d，期望 403", w.Code)
+	w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "192.0.2.10:1234", ""))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("非 loopback 状态码 = %d，期望普通 404", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "机器接口") || strings.Contains(w.Body.String(), "只允许本机") {
+		t.Errorf("非 loopback 不应泄露机器接口存在性: %s", w.Body.String())
 	}
 	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "[::1]:1234", "")); w.Code != http.StatusOK {
 		t.Errorf("IPv6 loopback 状态码 = %d，期望 200", w.Code)
@@ -191,8 +203,14 @@ func TestMachineHandlerAuthAndLoopback(t *testing.T) {
 
 func TestMachineEmptyTokenNeverAuthenticates(t *testing.T) {
 	h := machineHandler(passthrough(), newFakeMachine(), "")
-	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", "", "", "")); w.Code != http.StatusNotFound {
-		t.Errorf("空 token 挂载时状态码 = %d，期望 404", w.Code)
+	for _, target := range []string{"/api/machine/status", "/api/machine", "/api/machine/"} {
+		w := serveMachine(h, machineRequest(http.MethodGet, target, "", "", ""))
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s 空 token 挂载时状态码 = %d，期望 404", target, w.Code)
+		}
+		if strings.Contains(w.Body.String(), "机器接口") || strings.Contains(w.Body.String(), "未登录") {
+			t.Errorf("%s 空 token 不应泄露功能或管理面文案: %s", target, w.Body.String())
+		}
 	}
 	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", "whatever", "", "")); w.Code != http.StatusNotFound {
 		t.Errorf("空 token 挂载时带任意 token 状态码 = %d，期望 404", w.Code)
@@ -435,6 +453,12 @@ func TestMachineStart(t *testing.T) {
 	if w := serveMachine(h, machineRequest(http.MethodPost, "/api/machine/start?slot=1", machineTestToken, "", "")); w.Code != http.StatusBadRequest {
 		t.Errorf("只给 slot 状态码 = %d，期望 400", w.Code)
 	}
+	if w := serveMachine(h, machineRequest(http.MethodPost, "/api/machine/start?host=node-1&slot=3", machineTestToken, "", "")); w.Code != http.StatusBadRequest {
+		t.Errorf("host+slot 同时出现状态码 = %d，期望 400", w.Code)
+	}
+	if len(f.started) != 0 {
+		t.Errorf("host+slot 被拒绝时不应启动节点，实际 %+v", f.started)
+	}
 	if w := serveMachine(h, machineRequest(http.MethodPost, "/api/machine/start?host=ghost", machineTestToken, "", "")); w.Code != http.StatusNotFound {
 		t.Errorf("未知节点状态码 = %d，期望 404", w.Code)
 	}
@@ -510,6 +534,268 @@ func TestMachineAuditLogHasNoToken(t *testing.T) {
 	}
 	if strings.Contains(out, "Authorization") {
 		t.Errorf("审计日志不应记录请求头: %s", out)
+	}
+}
+
+func TestMachineRateLimitPerSource(t *testing.T) {
+	f := newFakeMachine()
+	h := machineHandler(passthrough(), f, machineTestToken)
+
+	setPublicIPOverride("203.0.113.10")
+	t.Cleanup(func() { setPublicIPOverride("") })
+
+	for i := 0; i < machineRateLimit; i++ {
+		if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "127.0.0.1:5000", "")); w.Code != http.StatusOK {
+			t.Fatalf("127.0.0.1 第 %d 次状态码 = %d，期望 200", i+1, w.Code)
+		}
+	}
+	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "127.0.0.1:6000", "")); w.Code != http.StatusTooManyRequests {
+		t.Errorf("127.0.0.1 超限状态码 = %d，期望 429", w.Code)
+	}
+	// 另一个 loopback 来源应该有自己的桶，不受 127.0.0.1 耗尽影响。
+	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "[::1]:6000", "")); w.Code != http.StatusOK {
+		t.Errorf("::1 状态码 = %d，期望 200（独立桶）", w.Code)
+	}
+	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "127.0.0.2:6000", "")); w.Code != http.StatusOK {
+		t.Errorf("127.0.0.2 状态码 = %d，期望 200（独立桶）", w.Code)
+	}
+}
+
+func TestMachineNonLoopbackNotAuditedOrLimited(t *testing.T) {
+	f := newFakeMachine()
+	h := machineHandler(passthrough(), f, machineTestToken)
+
+	var buf bytes.Buffer
+	oldOut := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldOut)
+		log.SetFlags(oldFlags)
+	})
+
+	// 超过限流额度，全部应普通 404，且不写审计、不占本机桶。
+	for i := 0; i < machineRateLimit+5; i++ {
+		w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "192.0.2.10:1234", ""))
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("非 loopback 第 %d 次状态码 = %d，期望 404", i+1, w.Code)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Errorf("非 loopback 请求不应写审计日志，实际: %s", buf.String())
+	}
+
+	setPublicIPOverride("203.0.113.10")
+	t.Cleanup(func() { setPublicIPOverride("") })
+	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "127.0.0.1:5000", "")); w.Code != http.StatusOK {
+		t.Errorf("非 loopback 不应消耗本机限流额度，loopback 状态码 = %d，期望 200", w.Code)
+	}
+}
+
+func TestMachineNodesAndJobs(t *testing.T) {
+	f := newFakeMachine()
+	f.nodes = []Node{{
+		HostName: "node-1", IP: "192.0.2.1", Country: "Japan", CountryCode: "JP",
+		Ping: 12, SpeedMbps: 3.5, Sessions: 4, Residential: true,
+		Config: "client\nremote 1.2.3.4\nsecret-config-line",
+	}}
+	job := f.jobs.New("测试作业", []string{"出口"})
+	h := machineHandler(passthrough(), f, machineTestToken)
+
+	w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/nodes", machineTestToken, "", ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("nodes 状态码 = %d，期望 200: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret-config-line") || strings.Contains(w.Body.String(), "remote 1.2.3.4") {
+		t.Errorf("nodes 不应返回 Node.Config: %s", w.Body.String())
+	}
+	var nodesResp struct {
+		Nodes []machineNode `json:"nodes"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &nodesResp); err != nil {
+		t.Fatalf("nodes 响应解析失败: %v", err)
+	}
+	if len(nodesResp.Nodes) != 1 || nodesResp.Nodes[0].Hostname != "node-1" ||
+		nodesResp.Nodes[0].CountryCode != "JP" || !nodesResp.Nodes[0].Residential {
+		t.Errorf("nodes 响应不符: %+v", nodesResp.Nodes)
+	}
+
+	w = serveMachine(h, machineRequest(http.MethodGet, "/api/machine/jobs", machineTestToken, "", ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("jobs 状态码 = %d，期望 200: %s", w.Code, w.Body.String())
+	}
+	var jobsResp struct {
+		Jobs []JobView `json:"jobs"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &jobsResp); err != nil {
+		t.Fatalf("jobs 响应解析失败: %v", err)
+	}
+	if len(jobsResp.Jobs) != 1 || jobsResp.Jobs[0].ID != job.ID() {
+		t.Fatalf("jobs 响应不符: %+v", jobsResp.Jobs)
+	}
+
+	w = serveMachine(h, machineRequest(http.MethodGet, "/api/machine/jobs?id=nope", machineTestToken, "", ""))
+	if err := json.Unmarshal(w.Body.Bytes(), &jobsResp); err != nil {
+		t.Fatalf("jobs 过滤响应解析失败: %v", err)
+	}
+	if len(jobsResp.Jobs) != 0 {
+		t.Errorf("jobs?id=nope 应返回空列表，实际 %+v", jobsResp.Jobs)
+	}
+}
+
+func TestNewMachineHandlerRejectsEmptyToken(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("newMachineHandler 传空 token 应 panic")
+		}
+	}()
+	newMachineHandler(passthrough(), newFakeMachine(), "", newMachineRateLimiters(1, time.Minute, time.Now))
+}
+
+func TestTokenMatchesEmptyWantNeverAllows(t *testing.T) {
+	if tokenMatches("", "") {
+		t.Error("tokenMatches 空 want 不应放行空 got")
+	}
+	if tokenMatches("anything", "") {
+		t.Error("tokenMatches 空 want 不应放行任意 got")
+	}
+}
+
+// stopRaceMachine 让两个 stop 都通过预检后再放行，模拟并发停同一槽位。
+type stopRaceMachine struct {
+	*fakeMachine
+	mu      sync.Mutex
+	present bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newStopRaceMachine() *stopRaceMachine {
+	return &stopRaceMachine{
+		fakeMachine: newFakeMachine(),
+		present:     true,
+		entered:     make(chan struct{}, 2),
+		release:     make(chan struct{}),
+	}
+}
+
+func (f *stopRaceMachine) Tunnels() []*Tunnel {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.present {
+		return nil
+	}
+	return []*Tunnel{{Slot: 1}}
+}
+
+func (f *stopRaceMachine) Stop(slot int) error {
+	f.entered <- struct{}{}
+	<-f.release
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.present {
+		f.present = false
+		return nil
+	}
+	return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
+}
+
+func TestMachineStopRaceReturns404(t *testing.T) {
+	f := newStopRaceMachine()
+	h := machineHandler(passthrough(), f, machineTestToken)
+
+	codes := make(chan int, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := serveMachine(h, machineRequest(http.MethodPost, "/api/machine/stop?slot=1", machineTestToken, "", ""))
+			codes <- w.Code
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-f.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("两个 stop 没有都进入 Stop")
+		}
+	}
+	close(f.release)
+	wg.Wait()
+	close(codes)
+
+	counts := map[int]int{}
+	for c := range codes {
+		counts[c]++
+	}
+	if counts[http.StatusOK] != 1 || counts[http.StatusNotFound] != 1 {
+		t.Fatalf("并发 stop 状态码 = %v，期望恰好一个 200、一个 404", counts)
+	}
+}
+
+// buildHandler 组装级测试：真实 mux + StripBasePath + auth.Wrap + machine 层。
+func TestBuildHandlerMachineDisabledAssembly(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := initBasePath(dir); err != nil {
+		t.Fatalf("initBasePath: %v", err)
+	}
+	t.Cleanup(func() { _, _ = setBasePath("") })
+	auth, _, err := NewAuth(dir)
+	if err != nil {
+		t.Fatalf("NewAuth: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("index")) })
+	mux.HandleFunc("/api/tunnels", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("tunnels")) })
+	f := newFakeMachine()
+
+	if _, err := setBasePath(""); err != nil {
+		t.Fatalf("setBasePath empty: %v", err)
+	}
+	h := buildHandler(mux, auth, f, "")
+	w := serveMachine(h, machineRequest(http.MethodGet, "/api/machine/status", "", "", ""))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("空 basepath + 未设置 token: /api/machine/status 状态码 = %d，期望 404", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "未登录") || strings.Contains(w.Body.String(), "机器接口") {
+		t.Errorf("空 basepath + 未设置 token 不应泄露文案: %s", w.Body.String())
+	}
+	if w := serveMachine(h, machineRequest(http.MethodGet, "/api/tunnels", "", "", "")); w.Code != http.StatusUnauthorized {
+		t.Errorf("管理面仍应要求登录，/api/tunnels 状态码 = %d，期望 401", w.Code)
+	}
+
+	bp, err := setBasePath("machinetest")
+	if err != nil {
+		t.Fatalf("setBasePath: %v", err)
+	}
+	for _, target := range []string{"/api/machine/status", bp + "/api/machine/status"} {
+		w := serveMachine(h, machineRequest(http.MethodGet, target, "", "", ""))
+		if w.Code != http.StatusNotFound {
+			t.Errorf("非空 basepath + 未设置 token: %s 状态码 = %d，期望 404", target, w.Code)
+		}
+		if strings.Contains(w.Body.String(), "未登录") {
+			t.Errorf("非空 basepath 下 %s 不应先被管理面拦成 401", target)
+		}
+	}
+	if w := serveMachine(h, machineRequest(http.MethodGet, bp+"/api/tunnels", "", "", "")); w.Code != http.StatusUnauthorized {
+		t.Errorf("管理面仍应要求登录，%s/api/tunnels 状态码 = %d，期望 401", bp, w.Code)
+	}
+
+	setPublicIPOverride("203.0.113.10")
+	t.Cleanup(func() { setPublicIPOverride("") })
+	enabled := buildHandler(mux, auth, f, machineTestToken)
+	if w := serveMachine(enabled, machineRequest(http.MethodGet, "/api/machine/status", machineTestToken, "", "")); w.Code != http.StatusOK {
+		t.Errorf("启用后固定路径状态码 = %d，期望 200: %s", w.Code, w.Body.String())
+	}
+	if w := serveMachine(enabled, machineRequest(http.MethodGet, bp+"/api/machine/status", machineTestToken, "", "")); w.Code != http.StatusOK {
+		t.Errorf("启用后 basepath 前缀路径状态码 = %d，期望 200: %s", w.Code, w.Body.String())
+	}
+	w = serveMachine(enabled, machineRequest(http.MethodGet, "/api/machine/status", "", "", ""))
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Header().Get("WWW-Authenticate"), "fanout-machine") {
+		t.Errorf("启用后无 token 应落到机器接口 401，实际 %d / %q", w.Code, w.Header().Get("WWW-Authenticate"))
 	}
 }
 

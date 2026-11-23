@@ -28,8 +28,12 @@ const (
 	machineMaxBodyBytes = 4 << 10
 	// machineMaxProvisionCount 挡住一次开几百条隧道的误操作。
 	machineMaxProvisionCount = 50
-	// machinePrefix 是机器接口的固定前缀，不依赖随机 basepath。
-	machinePrefix = "/api/machine/"
+	// machineRoot/machinePrefix 是机器接口的固定路径，不依赖随机 basepath。
+	machineRoot   = "/api/machine"
+	machinePrefix = machineRoot + "/"
+	// status 里的公网 IP 探测最多串行 3×5s，缓存一下避免轮询把管理进程拖住。
+	machineStatusIPTTL    = 60 * time.Second
+	machineStatusIPNegTTL = 10 * time.Second
 )
 
 // machineAPI 是机器接口依赖的最小 Manager 能力集。
@@ -43,9 +47,13 @@ type machineAPI interface {
 	Stop(slot int) error
 	Swap(slot int) error
 	Provision(req ProvisionRequest) (*Job, error)
+	Jobs() []JobView
 	// BackendName 返回 "3x-ui" / "native" / "xray-cf-lite"，不可用时为空串。
 	BackendName() string
 }
+
+// Jobs 返回最近的补出口作业，供机器接口只读轮询。
+func (m *Manager) Jobs() []JobView { return m.jobs.Views() }
 
 // BackendName 返回当前节点链接后端的类型，供机器接口状态展示。
 func (m *Manager) BackendName() string {
@@ -85,8 +93,21 @@ type machineStatusResponse struct {
 	Backend string        `json:"backend"`
 }
 
-// machineRateLimiter 是固定窗口计数器。只有一个 token 会生效，
-// 所以一个实例就等于"每 token 每窗口"的额度。
+// machineNode 是机器接口返回的节点白名单视图。
+// Node.Config（.ovpn 正文）带 json:"-"，这里也显式只挑安全字段。
+type machineNode struct {
+	Hostname    string  `json:"hostname"`
+	IP          string  `json:"ip"`
+	Country     string  `json:"country"`
+	CountryCode string  `json:"country_code"`
+	Ping        int     `json:"ping"`
+	SpeedMbps   float64 `json:"speed_mbps"`
+	Sessions    int     `json:"sessions"`
+	Residential bool    `json:"residential"`
+}
+
+// machineRateLimiter 是固定窗口计数器；按来源各持一个实例，
+// 所以一个实例就等于"每来源每窗口"的额度。
 type machineRateLimiter struct {
 	mu          sync.Mutex
 	limit       int
@@ -121,6 +142,57 @@ func (l *machineRateLimiter) allow() (bool, time.Duration) {
 	return true, 0
 }
 
+// stale 判断这个桶已经超过两个窗口没动过，可以回收。
+func (l *machineRateLimiter) stale(now time.Time, window time.Duration) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.windowStart.IsZero() && now.Sub(l.windowStart) >= 2*window
+}
+
+// machineRateLimiters 按来源隔离固定窗口：127.0.0.1 与 ::1 各自一个桶，
+// 本机某个进程刷爆额度不会连累另一个来源。
+type machineRateLimiters struct {
+	mu      sync.Mutex
+	limit   int
+	window  time.Duration
+	now     func() time.Time
+	buckets map[string]*machineRateLimiter
+}
+
+func newMachineRateLimiters(limit int, window time.Duration, now func() time.Time) *machineRateLimiters {
+	return &machineRateLimiters{
+		limit:   limit,
+		window:  window,
+		now:     now,
+		buckets: map[string]*machineRateLimiter{},
+	}
+}
+
+func (s *machineRateLimiters) allow(key string) (bool, time.Duration) {
+	s.mu.Lock()
+	b := s.buckets[key]
+	if b == nil {
+		s.sweepLocked()
+		b = newRateLimiter(s.limit, s.window, s.now)
+		s.buckets[key] = b
+	}
+	s.mu.Unlock()
+	return b.allow()
+}
+
+// sweepLocked 在桶数量变多时回收长期不用的来源。只在 map 锁内调用。
+func (s *machineRateLimiters) sweepLocked() {
+	if len(s.buckets) < 64 {
+		return
+	}
+	now := s.now()
+	for k, b := range s.buckets {
+		if b.stale(now, s.window) {
+			delete(s.buckets, k)
+		}
+	}
+}
+
 // machineTokenFromEnv 读取并校验机器接口 token。
 // 未设置返回空串（接口不启用）；设置但太短属于配置错误，直接报错。
 func machineTokenFromEnv(getenv func(string) string) (string, error) {
@@ -136,49 +208,79 @@ func machineTokenFromEnv(getenv func(string) string) (string, error) {
 }
 
 // machineHandler 把机器接口包在管理面外面：固定路径、仅 loopback、
-// Bearer token、每 token 限流。token 为空时接口整体不存在（404），
-// 不会因为误挂载而出现免鉴权入口。
+// Bearer token、按来源限流。token 为空时接口整体不存在（普通 404），
+// 不会因为误挂载而出现免鉴权入口，也不泄露这里有机器接口。
 func machineHandler(next http.Handler, m machineAPI, token string) http.Handler {
 	if token == "" {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, machinePrefix) {
-				machineJSON(w, http.StatusNotFound, map[string]string{"error": "机器接口未启用"})
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
+		return machineDisabledHandler(next)
 	}
-	return newMachineHandler(next, m, token, newRateLimiter(machineRateLimit, machineRateWindow, time.Now))
+	return newMachineHandler(next, m, token,
+		newMachineRateLimiters(machineRateLimit, machineRateWindow, time.Now))
 }
 
-func newMachineHandler(next http.Handler, m machineAPI, token string, rl *machineRateLimiter) http.Handler {
+// machineDisabledHandler 在未配置 token 时占位：机器路径一律普通 404，
+// 与其它未知路径不可区分；其它路径原样交给内层。
+func machineDisabledHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, machinePrefix) {
+		if _, ok := machineAction(r.URL.Path); ok {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// machineAction 判断路径是不是机器接口，并返回端点名（不含前缀）。
+// 固定路径与「basepath + 固定路径」都认，后者是为了在设置过访问路径时
+// 也不会先落进管理面鉴权拿到 401。
+func machineAction(path string) (string, bool) {
+	roots := []string{machineRoot}
+	if base := currentBasePath(); base != "" {
+		roots = append(roots, base+machineRoot)
+	}
+	for _, root := range roots {
+		if path == root {
+			return "", true
+		}
+		if strings.HasPrefix(path, root+"/") {
+			return strings.TrimPrefix(path, root+"/"), true
+		}
+	}
+	return "", false
+}
+
+func newMachineHandler(next http.Handler, m machineAPI, token string, rl *machineRateLimiters) http.Handler {
+	if token == "" {
+		// 构造器层面直接拒绝，避免后续重构把空 token 当成「永不匹配」放进来。
+		panic("newMachineHandler: 机器接口 token 不能为空")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		action, ok := machineAction(r.URL.Path)
+		if !ok {
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		action := strings.TrimPrefix(r.URL.Path, machinePrefix)
 		remote := r.RemoteAddr
 
 		// 内部错误统一收敛成 JSON 500，避免 panic 把连接直接切断、
 		// 让管理器只拿到 EOF 却不知道发生了什么。
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("机器接口内部错误: 动作=%s 详情=%v", sanitizeAudit(action), rec)
+				log.Printf("机器接口内部错误: 动作=%s 详情=%s", sanitizeAudit(action), sanitizeAudit(fmt.Sprint(rec)))
 				machineJSON(w, http.StatusInternalServerError, map[string]string{"error": "内部错误"})
 			}
 		}()
 
+		// 非 loopback 一律当普通 404：不写审计、不进限流，避免公网请求
+		// 把日志和 CPU 放大，也不暴露这里存在机器接口。
 		if !isLoopbackRequest(r) {
-			machineAudit(remote, action, "", http.StatusForbidden)
-			machineJSON(w, http.StatusForbidden, map[string]string{"error": "只允许本机访问"})
+			http.NotFound(w, r)
 			return
 		}
 
 		// 限流放在鉴权之前：本机进程拿错 token 反复试也要被计数，
-		// 否则限流只保护"猜对了的人"。
-		if ok, wait := rl.allow(); !ok {
+		// 否则限流只保护"猜对了的人"。按来源各用一个桶。
+		if ok, wait := rl.allow(clientIP(r)); !ok {
 			sec := int(wait.Seconds())
 			if sec < 1 {
 				sec = 1
@@ -199,7 +301,7 @@ func newMachineHandler(next http.Handler, m machineAPI, token string, rl *machin
 			return
 		}
 
-		route, ok := machineRoutes()[r.URL.Path]
+		route, ok := machineRoutes()[machinePrefix+action]
 		if !ok {
 			machineAudit(remote, action, "", http.StatusNotFound)
 			machineJSON(w, http.StatusNotFound, map[string]string{"error": "未知的机器接口端点"})
@@ -238,6 +340,8 @@ func machineRoutes() map[string]machineRoute {
 		"/api/machine/swap":      {http.MethodPost, machineSwap},
 		"/api/machine/stop":      {http.MethodPost, machineStop},
 		"/api/machine/start":     {http.MethodPost, machineStart},
+		"/api/machine/jobs":      {http.MethodGet, machineJobs},
+		"/api/machine/nodes":     {http.MethodGet, machineNodes},
 	}
 }
 
@@ -263,8 +367,39 @@ func machineReadBody(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+var (
+	machineStatusIPMu sync.Mutex
+	machineStatusIP   string
+	machineStatusIPAt time.Time
+)
+
+// machineStatusHost 给 status 提供带缓存的公网 IP。
+//
+// 成功缓存 60s、失败负缓存 10s：母机出网异常时，管理器轮询 status
+// 不会每次都串行探测 3 个 URL（每个 5s）。显式 -ip / FANOUT_PUBLIC_IP
+// 直接返回，不经过缓存。持锁探测顺带把并发请求合并成一次。
+func machineStatusHost() string {
+	if ip := publicIPOverrideValue(); ip != "" {
+		return ip
+	}
+	machineStatusIPMu.Lock()
+	defer machineStatusIPMu.Unlock()
+
+	ttl := machineStatusIPTTL
+	if machineStatusIP == "" {
+		ttl = machineStatusIPNegTTL
+	}
+	if !machineStatusIPAt.IsZero() && time.Since(machineStatusIPAt) < ttl {
+		return machineStatusIP
+	}
+	ip := hostPublicIP()
+	machineStatusIP = ip
+	machineStatusIPAt = time.Now()
+	return ip
+}
+
 func machineStatus(m machineAPI, _ *http.Request) (int, any, string) {
-	host := hostPublicIP()
+	host := machineStatusHost()
 	view := machineStatusView(m, host)
 	return http.StatusOK, view, fmt.Sprintf("total=%d up=%d suspect=%d",
 		view.Counts.Total, view.Counts.Up, view.Counts.Suspect)
@@ -303,6 +438,42 @@ func machineStatusView(m machineAPI, host string) machineStatusResponse {
 		}
 	}
 	return resp
+}
+
+func machineNodes(m machineAPI, _ *http.Request) (int, any, string) {
+	nodes, fetched := m.Nodes()
+	out := make([]machineNode, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, machineNode{
+			Hostname:    n.HostName,
+			IP:          n.IP,
+			Country:     n.Country,
+			CountryCode: n.CountryCode,
+			Ping:        n.Ping,
+			SpeedMbps:   n.SpeedMbps,
+			Sessions:    n.Sessions,
+			Residential: n.Residential,
+		})
+	}
+	return http.StatusOK, map[string]any{
+		"nodes":            out,
+		"fetched":          fetched,
+		"residential_only": residentialOnly(),
+	}, fmt.Sprintf("nodes=%d", len(out))
+}
+
+func machineJobs(m machineAPI, r *http.Request) (int, any, string) {
+	views := m.Jobs()
+	if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
+		kept := make([]JobView, 0, 1)
+		for _, v := range views {
+			if v.ID == id {
+				kept = append(kept, v)
+			}
+		}
+		views = kept
+	}
+	return http.StatusOK, map[string]any{"jobs": views}, fmt.Sprintf("jobs=%d", len(views))
 }
 
 func machineProvision(m machineAPI, r *http.Request) (int, any, string) {
@@ -372,6 +543,11 @@ func machineStop(m machineAPI, r *http.Request) (int, any, string) {
 		return http.StatusNotFound, map[string]string{"error": slotMissing(slot)}, target
 	}
 	if err := m.Stop(slot); err != nil {
+		// 与 swap 对齐：并发停同一槽位时先到的已经删掉了隧道，
+		// 后到的按不存在返回 404，而不是把竞态报成 500。
+		if !machineHasSlot(m, slot) {
+			return http.StatusNotFound, map[string]string{"error": slotMissing(slot)}, target
+		}
 		return http.StatusInternalServerError, map[string]string{"error": err.Error()}, target
 	}
 	return http.StatusOK, map[string]any{"ok": true, "slot": slot}, target
@@ -384,13 +560,14 @@ func machineStop(m machineAPI, r *http.Request) (int, any, string) {
 // 就传 host，拿到返回的 slot 后再用 swap/stop 管它。
 func machineStart(m machineAPI, r *http.Request) (int, any, string) {
 	q := r.URL.Query()
+	// 只要出现 slot 就拒绝：无论 host 是否为空，避免集成方误以为能指定槽位。
+	if strings.TrimSpace(q.Get("slot")) != "" {
+		return http.StatusBadRequest, map[string]string{
+			"error": "start 按 host 启动，槽位由服务端自动分配；不要传 slot",
+		}, "host="
+	}
 	host := strings.TrimSpace(q.Get("host"))
 	if host == "" {
-		if strings.TrimSpace(q.Get("slot")) != "" {
-			return http.StatusBadRequest, map[string]string{
-				"error": "start 按 host 启动，槽位由服务端自动分配；不要传 slot",
-			}, "host="
-		}
 		return http.StatusBadRequest, map[string]string{"error": "缺少 host 参数"}, "host="
 	}
 	target := "host=" + sanitizeAudit(host)
@@ -488,8 +665,8 @@ func sanitizeAudit(s string) string {
 		}
 		return r
 	}, s)
-	if len(s) > 80 {
-		s = s[:80]
+	if utf8.RuneCountInString(s) > 80 {
+		s = string([]rune(s)[:80])
 	}
 	return s
 }

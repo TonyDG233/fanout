@@ -157,19 +157,25 @@ FANOUT_MACHINE_TOKEN=<至少 16 个字符的随机串>
 ### 鉴权与限流
 
 - 仅接受 loopback（`127.0.0.1` / `::1`）来源，按 `RemoteAddr` 判断，不采信
-  `X-Forwarded-For` 之类可伪造的头。
+  `X-Forwarded-For` 之类可伪造的头。非 loopback 请求一律返回普通 404，
+  不写审计、不进限流，避免公网请求放大日志/CPU。
 - 每个请求带 `Authorization: Bearer <token>`，token 用常量时间比较。
-  变量未设置时接口整体不存在（404）；设置但不足 16 个字符会拒绝启用，进程直接报错退出。
+  变量未设置时接口整体不存在（普通 404，即使访问路径为空也成立）；设置但不足
+  16 个字符会在启动最开始（恢复隧道、启动健康检查之前）报错退出。
 - 固定路径 `/api/machine/*`，不经过随机访问路径，也不复用管理面登录会话。
-- 每个 token 每分钟 30 次，超限返回 `429` 并带 `Retry-After`。
+- 每个来源（`127.0.0.1`、`::1` 等）每分钟 30 次，各自一个桶；超限返回 `429`
+  并带 `Retry-After`。
 - POST 请求体上限 4 KiB（端点本身只用 query 参数）。
 - 审计日志只记时间、来源、动作、slot/region 和结果，不记 token、请求头或响应体。
+- `status` 里的公网 IP 有 60s 缓存、探测失败负缓存 10s，避免轮询时反复串行探测。
 
 ### 端点
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/machine/status` | 返回出口状态与 SOCKS5 地址 |
+| GET | `/api/machine/nodes` | 返回节点白名单（主机名/国家/测速等，不含 `.ovpn` 正文） |
+| GET | `/api/machine/jobs[?id=...]` | 返回补出口作业进度（可按 id 过滤） |
 | POST | `/api/machine/provision?region=JP&count=1[&template=N]` | 异步补出口，返回 `{"job":"..."}` |
 | POST | `/api/machine/swap?slot=N` | 就地换节点（端口不变） |
 | POST | `/api/machine/stop?slot=N` | 停掉出口并释放槽位 |
@@ -200,11 +206,12 @@ FANOUT_MACHINE_TOKEN=<至少 16 个字符的随机串>
   `.ovpn`、`Node.Config`、`state.json` 或任何其他凭据。
 - 只读接口 `/api/readonly/*` 继续不返回凭据，两者权限边界不同，不要混用。
 - `start` 没有 `slot` 参数：槽位由 Manager 按空闲顺序分配，停掉的槽位已经释放，
-  用旧 slot 启动不存在对应语义。拿到返回的 `slot` 之后再用 `swap`/`stop` 管理。
+  用旧 slot 启动不存在对应语义。只要请求里出现 `slot`（无论是否同时给 `host`）
+  一律返回 400。拿到返回的 `slot` 之后再用 `swap`/`stop` 管理。
 - `provision` 的 `region` 可省略（不限地区），填了必须是两位国家码；`count` 取值 1~50。
   `template` 在 `xray-cf-lite` 后端下自动忽略。
 - 错误一律返回 JSON：`400` 参数错误或业务拒绝、`404` 槽位/节点不存在、`429` 限流、
-  `500` 内部错误。
+  `500` 内部错误。例外：接口未启用或非 loopback 来源时是普通 404，不返回功能相关文案。
 
 ## 运维
 

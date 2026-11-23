@@ -76,8 +76,11 @@ func readonlyHealth(m *Manager) readonlyHealthResponse {
 }
 
 // tokenMatches 用恒定时间比较 token，避免按响应时间逐字符猜。
-// 先各自哈希，长度不同也不会提前返回。
+// 先各自哈希，长度不同也不会提前返回。want 为空表示未启用，永不放行。
 func tokenMatches(got, want string) bool {
+	if want == "" {
+		return false
+	}
 	g := sha256.Sum256([]byte(got))
 	w := sha256.Sum256([]byte(want))
 	return subtle.ConstantTimeCompare(g[:], w[:]) == 1

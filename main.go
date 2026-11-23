@@ -37,6 +37,13 @@ func main() {
 		return
 	}
 
+	// 机器接口配置在任何副作用之前校验：token 非法直接退出，
+	// 不会先恢复隧道/拉起健康检查而留下子进程或 netns。
+	machineTok, err := machineTokenFromEnv(os.Getenv)
+	if err != nil {
+		log.Fatalf("机器接口配置错误: %v", err)
+	}
+
 	if os.Geteuid() != 0 {
 		log.Fatal("需要 root 权限（要创建 netns 和改 iptables）")
 	}
@@ -170,23 +177,16 @@ func main() {
 	}
 
 	// 管理面默认走"随机访问路径 + 12h 会话"。
-	// 只读出口 API 是给宿主上的外部出口管理器用的：固定路径、仅 loopback、
-	// Bearer token，而且只在 FANOUT_READONLY_TOKEN 非空时才存在。
-	var handler http.Handler = StripBasePath(auth.Wrap(mux))
+	// 机器接口与只读接口都挂在固定路径上、位于随机 basepath 与登录鉴权之前；
+	// 机器接口无条件安装，未设置 token 时对 /api/machine/* 返回普通 404。
+	handler := buildHandler(mux, auth, mgr, machineTok)
+	if machineTok != "" {
+		log.Printf("机器接口已启用（固定路径 /api/machine/*，仅本机，需 Bearer token，每来源 %d 次/分钟）",
+			machineRateLimit)
+	}
 	if tok := strings.TrimSpace(os.Getenv(readonlyTokenEnv)); tok != "" {
 		handler = readonlyHandler(handler, mgr, tok)
 		log.Printf("只读出口 API 已启用（固定路径 /api/readonly/*，仅本机，需 Bearer token）")
-	}
-	// 机器接口是给宿主出口管理器做补充/换节点/读状态用的，权限比只读接口大，
-	// 所以另设一个更长的 token；没设置就完全不存在。
-	machineTok, err := machineTokenFromEnv(os.Getenv)
-	if err != nil {
-		log.Fatalf("机器接口配置错误: %v", err)
-	}
-	if machineTok != "" {
-		handler = machineHandler(handler, mgr, machineTok)
-		log.Printf("机器接口已启用（固定路径 /api/machine/*，仅本机，需 Bearer token，每 token %d 次/分钟）",
-			machineRateLimit)
 	}
 	srv := newWebServer(handler)
 	// 设置面板：改密码 / 改路径 / 改端口 / 改本地监听。
@@ -199,6 +199,17 @@ func main() {
 	if err := srv.serve(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// buildHandler 组装管理面 handler：
+//
+//	机器接口（固定路径） → 随机 basepath → 登录会话 → 业务 mux
+//
+// 机器接口必须位于 auth.Wrap 之外，否则未设置 token 时会被管理面先拦成 401；
+// 它在 token 为空时对机器路径返回普通 404。只读接口由调用方再包一层（路径不重叠）。
+func buildHandler(mux http.Handler, auth *Auth, mgr machineAPI, machineToken string) http.Handler {
+	var handler http.Handler = StripBasePath(auth.Wrap(mux))
+	return machineHandler(handler, mgr, machineToken)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

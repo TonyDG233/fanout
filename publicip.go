@@ -31,6 +31,13 @@ func setPublicIPOverride(ip string) {
 	publicIPMu.Unlock()
 }
 
+// publicIPOverrideValue 返回显式覆盖值，供带独立缓存的调用方绕开探测。
+func publicIPOverrideValue() string {
+	publicIPMu.Lock()
+	defer publicIPMu.Unlock()
+	return publicIPOverride
+}
+
 // hostPublicIP 返回跑 fanout 这台母机的公网 IPv4。
 // 优先用显式覆盖值；否则用缓存（未过期）；再否则对外探测一次。
 // 探测不到就返回空串，由调用方决定兜底。
