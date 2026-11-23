@@ -177,6 +177,17 @@ func main() {
 		handler = readonlyHandler(handler, mgr, tok)
 		log.Printf("只读出口 API 已启用（固定路径 /api/readonly/*，仅本机，需 Bearer token）")
 	}
+	// 机器接口是给宿主出口管理器做补充/换节点/读状态用的，权限比只读接口大，
+	// 所以另设一个更长的 token；没设置就完全不存在。
+	machineTok, err := machineTokenFromEnv(os.Getenv)
+	if err != nil {
+		log.Fatalf("机器接口配置错误: %v", err)
+	}
+	if machineTok != "" {
+		handler = machineHandler(handler, mgr, machineTok)
+		log.Printf("机器接口已启用（固定路径 /api/machine/*，仅本机，需 Bearer token，每 token %d 次/分钟）",
+			machineRateLimit)
+	}
 	srv := newWebServer(handler)
 	// 设置面板：改密码 / 改路径 / 改端口 / 改本地监听。
 	mux.HandleFunc("/api/settings", apiSettings(auth, srv))

@@ -143,6 +143,69 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 `-panel 3x-ui` / `-panel native` / `-panel xray-cf-lite` 启动参数固定。
 界面里选过之后会记住，重启仍然生效。
 
+## 机器接口
+
+给宿主上的出口管理器用的固定路径 API：读状态、补出口、换节点、停/起出口。
+默认完全不启用，设置环境变量后才存在：
+
+```bash
+FANOUT_MACHINE_TOKEN=<至少 16 个字符的随机串>
+```
+
+建议用 systemd `EnvironmentFile` 从权限 600 的文件读取，不要写进命令行或提交到仓库。
+
+### 鉴权与限流
+
+- 仅接受 loopback（`127.0.0.1` / `::1`）来源，按 `RemoteAddr` 判断，不采信
+  `X-Forwarded-For` 之类可伪造的头。
+- 每个请求带 `Authorization: Bearer <token>`，token 用常量时间比较。
+  变量未设置时接口整体不存在（404）；设置但不足 16 个字符会拒绝启用，进程直接报错退出。
+- 固定路径 `/api/machine/*`，不经过随机访问路径，也不复用管理面登录会话。
+- 每个 token 每分钟 30 次，超限返回 `429` 并带 `Retry-After`。
+- POST 请求体上限 4 KiB（端点本身只用 query 参数）。
+- 审计日志只记时间、来源、动作、slot/region 和结果，不记 token、请求头或响应体。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/machine/status` | 返回出口状态与 SOCKS5 地址 |
+| POST | `/api/machine/provision?region=JP&count=1[&template=N]` | 异步补出口，返回 `{"job":"..."}` |
+| POST | `/api/machine/swap?slot=N` | 就地换节点（端口不变） |
+| POST | `/api/machine/stop?slot=N` | 停掉出口并释放槽位 |
+| POST | `/api/machine/start?host=<节点主机名>` | 按节点开一条新出口，槽位由服务端分配 |
+
+`status` 响应：
+
+```json
+{
+  "exits": [
+    {
+      "slot": 1,
+      "port": 1080,
+      "status": "up",
+      "exit_ip": "203.0.113.9",
+      "country": "日本",
+      "country_code": "JP",
+      "suspect": false,
+      "socks_url": "socks5://foXXXXXX:XXXXXXXXXXXXXX@203.0.113.9:1080"
+    }
+  ],
+  "counts": {"total": 1, "up": 1, "suspect": 0},
+  "backend": "native"
+}
+```
+
+- `socks_url` 带 SOCKS5 用户名/口令，管理器要靠它接管出口。除此之外不返回
+  `.ovpn`、`Node.Config`、`state.json` 或任何其他凭据。
+- 只读接口 `/api/readonly/*` 继续不返回凭据，两者权限边界不同，不要混用。
+- `start` 没有 `slot` 参数：槽位由 Manager 按空闲顺序分配，停掉的槽位已经释放，
+  用旧 slot 启动不存在对应语义。拿到返回的 `slot` 之后再用 `swap`/`stop` 管理。
+- `provision` 的 `region` 可省略（不限地区），填了必须是两位国家码；`count` 取值 1~50。
+  `template` 在 `xray-cf-lite` 后端下自动忽略。
+- 错误一律返回 JSON：`400` 参数错误或业务拒绝、`404` 槽位/节点不存在、`429` 限流、
+  `500` 内部错误。
+
 ## 运维
 
 装完后敲 `f` 打开管理菜单：启停、看日志、查隧道、改端口/口令/访问路径、更新、卸载。
