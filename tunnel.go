@@ -46,6 +46,9 @@ type Tunnel struct {
 	// 两边对不上，那个入站就掉成了没人认领的孤儿。
 	// 这个字段跟着状态一起落盘，重启后照着它把入站接回来。
 	prevHost string
+	// suspect 由健康探测置位：出口 IP 与建隧道时拿到的那个不一致。
+	// 只影响只读状态展示，不参与调度，也不会触发任何进程操作。
+	suspect bool
 }
 
 // prevHostOf 读"换节点未收尾"标记。
@@ -324,6 +327,32 @@ func (t *Tunnel) setCredential(c SocksCred) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Cred = c
+}
+
+// markSuspect 把出口标记为 suspect，返回是否发生了从正常到可疑的变化，
+// 便于调用方只在状态翻转时打一条日志，而不是每 10 秒刷屏。
+func (t *Tunnel) markSuspect() (changed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.suspect {
+		return false
+	}
+	t.suspect = true
+	return true
+}
+
+// clearSuspect 在出口 IP 恢复一致后清掉可疑标记。
+func (t *Tunnel) clearSuspect() {
+	t.mu.Lock()
+	t.suspect = false
+	t.mu.Unlock()
+}
+
+// isSuspect 返回当前可疑标记，供只读状态接口读取。
+func (t *Tunnel) isSuspect() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.suspect
 }
 
 // probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。

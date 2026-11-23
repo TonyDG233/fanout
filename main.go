@@ -169,7 +169,15 @@ func main() {
 		log.Fatalf("加载 Web 设置失败: %v", err)
 	}
 
-	srv := newWebServer(StripBasePath(auth.Wrap(mux)))
+	// 管理面默认走"随机访问路径 + 12h 会话"。
+	// 只读出口 API 是给宿主上的外部出口管理器用的：固定路径、仅 loopback、
+	// Bearer token，而且只在 FANOUT_READONLY_TOKEN 非空时才存在。
+	var handler http.Handler = StripBasePath(auth.Wrap(mux))
+	if tok := strings.TrimSpace(os.Getenv(readonlyTokenEnv)); tok != "" {
+		handler = readonlyHandler(handler, mgr, tok)
+		log.Printf("只读出口 API 已启用（固定路径 /api/readonly/*，仅本机，需 Bearer token）")
+	}
+	srv := newWebServer(handler)
 	// 设置面板：改密码 / 改路径 / 改端口 / 改本地监听。
 	mux.HandleFunc("/api/settings", apiSettings(auth, srv))
 	mux.HandleFunc("/api/update/check", apiUpdateCheck)
